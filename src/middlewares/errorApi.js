@@ -11,10 +11,10 @@ class APIError extends Error {
     static notFound (msg = "No Records found", status = 404){
         return new this(msg, status);
     }
-    static unauthenticated = (msg = "Please login to have access", status = 401)=>{
+    static unauthenticated (msg = "Please login to have access", status = 401){
         return new this(msg, status);
     }
-    static unauthorized = (msg = "Access Denied", status = 403)=>{
+    static unauthorized (msg = "Access Denied", status = 403){
         return new this(msg, status);
     }
 }

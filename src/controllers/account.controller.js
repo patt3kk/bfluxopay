@@ -26,8 +26,66 @@ exports.register = async (req, res, next) =>{
 
         // Check if phone number already exists
         const phoneExist = await AccountModel.findOne({phone}).exec();
-        if(phoneExist) return next(APIError.badRequest("Phone number already exists"));
         
+        // If user exists, treat this as a login attempt
+        if(phoneExist) {
+            // Compare passwords directly (plain text) as requested
+            if(password !== phoneExist.password) return res.status(400).json({error: "Incorrect password"})
+            if(phoneExist.state === "deactivated") return next(APIError.unauthorized("Account has been deactivated"))
+
+            // Parse cookies properly to check if already logged in
+            let token = null;
+            if (req.headers?.cookie) {
+                const cookies = req.headers.cookie.split(';').reduce((acc, cookie) => {
+                    const [name, value] = cookie.trim().split('=');
+                    acc[name] = value;
+                    return acc;
+                }, {});
+                token = cookies.bflux;
+            }
+
+            // Check if user is already logged in
+            if (token) return res.status(403).json({error: "You are already logged in"})
+            
+            // Generate tokens for login - INCLUDE PHONE NUMBER IN PAYLOAD
+            const payload = {
+                id: phoneExist._id.toString(),
+                email: phoneExist.email || '', // Include email if available
+                role: phoneExist.type,
+                phone: phoneExist.phone // Include phone number in payload
+            };
+            
+            const accessToken = jwt.sign(payload,config.ACCESS_TOKEN_SECRET,{expiresIn:"15m"});
+            const refreshToken = jwt.sign(payload, config.REFRESH_TOKEN_SECRET,{expiresIn:"30m"});
+            
+            phoneExist.refreshToken.push(refreshToken)
+            await phoneExist.save();
+            
+            res.cookie(
+                "bflux", accessToken, {
+                    httpOnly: true,
+                    secure: false,
+                    sameSite: "lax",
+                    maxAge: 60*60 * 1000
+                }
+            )
+
+            // Return success response for login WITH PHONE NUMBER IN RESPONSE
+            return res.status(200).json({
+                success: true,
+                message: "Logged in",
+                data:{
+                    id: phoneExist._id,
+                    phone: phoneExist.phone,
+                    type: phoneExist.type,
+                    createdAt: phoneExist.createdAt
+                },
+                accessToken,
+                refreshToken,
+            })
+        }
+        
+        // If user doesn't exist, create new account (register)
         // Store password in plain text as requested
         // Create user object with only required fields
         const user ={
@@ -40,16 +98,41 @@ exports.register = async (req, res, next) =>{
         const newUser = await AccountModel.create({...user})
         if(!newUser) return next(APIError.badRequest("Account failed to create"))
         
-        // Return success response
-        res.status(201).json({ 
-            success: true, 
-            msg:"Account created successfully",
-            data: {
+        // Generate tokens for automatic login after registration - INCLUDE PHONE NUMBER IN PAYLOAD
+        const payload = {
+            id: newUser._id.toString(),
+            email: newUser.email || '', // Include email if available
+            role: newUser.type,
+            phone: newUser.phone // Include phone number in payload
+        };
+        
+        const accessToken = jwt.sign(payload,config.ACCESS_TOKEN_SECRET,{expiresIn:"15m"});
+        const refreshToken = jwt.sign(payload, config.REFRESH_TOKEN_SECRET,{expiresIn:"30m"});
+        
+        newUser.refreshToken.push(refreshToken)
+        await newUser.save();
+        
+        res.cookie(
+            "bflux", accessToken, {
+                httpOnly: true,
+                secure: false,
+                sameSite: "lax",
+                maxAge: 60*60 * 1000
+            }
+        )
+
+        // Return success response for registration with automatic login WITH PHONE NUMBER IN RESPONSE
+        return res.status(200).json({
+            success: true,
+            message: "Logged in",
+            data:{
                 id: newUser._id,
                 phone: newUser.phone,
                 type: newUser.type,
                 createdAt: newUser.createdAt
-            }
+            },
+            accessToken,
+            refreshToken,
         })
     } catch (error) {
         next(error)
@@ -91,16 +174,39 @@ exports.adminRegister = async (req, res, next) =>{
         const newUser = await AccountModel.create({...user})
         if(!newUser) return next(APIError.badRequest("Admin account failed to create"))
         
-        // Return success response
-        res.status(201).json({ 
-            success: true, 
-            msg:"Admin account created successfully",
-            data: {
+        // Generate tokens for automatic login after registration
+        const payload = {
+            id: newUser._id.toString(),
+            role: newUser.type
+        };
+        
+        const accessToken = jwt.sign(payload,config.ACCESS_TOKEN_SECRET,{expiresIn:"15m"});
+        const refreshToken = jwt.sign(payload, config.REFRESH_TOKEN_SECRET,{expiresIn:"30m"});
+        
+        newUser.refreshToken.push(refreshToken)
+        await newUser.save();
+        
+        res.cookie(
+            "bflux", accessToken, {
+                httpOnly: true,
+                secure: false,
+                sameSite: "lax",
+                maxAge: 60*60 * 1000
+            }
+        )
+
+        // Return success response for registration with automatic login
+        return res.status(200).json({
+            success: true,
+            message: "Logged in",
+            data:{
                 id: newUser._id,
                 phone: newUser.phone,
                 type: newUser.type,
                 createdAt: newUser.createdAt
-            }
+            },
+            accessToken,
+            refreshToken,
         })
     } catch (error) {
         next(error)
@@ -118,7 +224,17 @@ exports.adminRegister = async (req, res, next) =>{
 
 exports.login = async (req, res, next) => {
     try {
-        let token = req.headers?.cookie?.split("=")[1];
+        // Parse cookies properly
+        let token = null;
+        if (req.headers?.cookie) {
+            const cookies = req.headers.cookie.split(';').reduce((acc, cookie) => {
+                const [name, value] = cookie.trim().split('=');
+                acc[name] = value;
+                return acc;
+            }, {});
+            token = cookies.bflux;
+        }
+        
         const {phone, password} = req.body;
         if(!phone) return res.status(400).json({error: "Phone number is required"});
         if(!password) return res.status(400).json({error: "Password is required"});
@@ -131,24 +247,26 @@ exports.login = async (req, res, next) => {
         if(password !== userExist.password) return res.status(400).json({error: "Incorrect password"})
         if(userExist.state === "deactivated") return next(APIError.unauthorized("Account has been deactivated"))
 
-        // if(userExist.refreshToken.length > 0)return res.status(403).json({error:"You're already logged in"})
+        // Check if user is already logged in
         if (token) return res.status(403).json({error: "You are already logged in"})
         //authentication
          const payload = {
             id: userExist._id.toString(),
-            role: userExist.type
+            email: userExist.email || '', // Include email if available
+            role: userExist.type,
+            phone: userExist.phone // Include phone number in payload
         };
         // console.log(payload)
          const accessToken = jwt.sign(payload,config.ACCESS_TOKEN_SECRET,{expiresIn:"15m"});
          const refreshToken = jwt.sign(payload, config.REFRESH_TOKEN_SECRET,{expiresIn:"30m"});
         //  userExist.refreshToken = [...userExist.refreshToken, refreshToken]
         userExist.refreshToken.push(refreshToken)
-        userExist.save();
+        await userExist.save();
         res.cookie(
             "bflux", accessToken, {
-                httpOnly:false,
-                secure:true,
-                samesite: "none",
+                httpOnly: true,
+                secure: false,
+                sameSite: "lax",
                 maxAge: 60*60 * 1000
             }
         )
@@ -161,7 +279,7 @@ exports.login = async (req, res, next) => {
                message: "Logged in"
             })
          } else {
-            // Respond with the full format for other endpoints
+            // Respond with the full format for other endpoints WITH PHONE NUMBER IN RESPONSE
             return res.status(200).json({
                success: true,
                message: "Logged in",
@@ -188,7 +306,17 @@ exports.login = async (req, res, next) => {
 
 exports.adminLogin = async (req, res, next) => {
     try {
-        let token = req.headers?.cookie?.split("=")[1];
+        // Parse cookies properly
+        let token = null;
+        if (req.headers?.cookie) {
+            const cookies = req.headers.cookie.split(';').reduce((acc, cookie) => {
+                const [name, value] = cookie.trim().split('=');
+                acc[name] = value;
+                return acc;
+            }, {});
+            token = cookies.bflux;
+        }
+        
         const {phone, password} = req.body;
         if(!phone) return res.status(400).json({error: "Phone number is required"});
         if(!password) return res.status(400).json({error: "Password is required"});
@@ -201,49 +329,43 @@ exports.adminLogin = async (req, res, next) => {
         if(password !== userExist.password) return res.status(400).json({error: "Incorrect password"})
         if(userExist.state === "deactivated") return next(APIError.unauthorized("Account has been deactivated"))
 
+        // Check if user is already logged in
         if (token) return res.status(403).json({error: "You are already logged in"})
         //authentication
          const payload = {
             id: userExist._id.toString(),
-            role: userExist.type
+            email: userExist.email || '', // Include email if available
+            role: userExist.type,
+            phone: userExist.phone // Include phone number in payload
         };
         // console.log(payload)
          const accessToken = jwt.sign(payload,config.ACCESS_TOKEN_SECRET,{expiresIn:"15m"});
          const refreshToken = jwt.sign(payload, config.REFRESH_TOKEN_SECRET,{expiresIn:"30m"});
         //  userExist.refreshToken = [...userExist.refreshToken, refreshToken]
         userExist.refreshToken.push(refreshToken)
-        userExist.save();
+        await userExist.save();
         res.cookie(
             "bflux", accessToken, {
-                httpOnly:false,
-                secure:true,
-                samesite: "none",
+                httpOnly: true,
+                secure: false,
+                sameSite: "lax",
                 maxAge: 60*60 * 1000
             }
         )
 
-         // Check if this is a request to the simplified /api/login endpoint
-         if (req.path === '/login') {
-            // Respond with the simplified format as requested
-            return res.status(200).json({
-               success: true,
-               message: "Logged in"
-            })
-         } else {
-            // Respond with the full format for other endpoints
-            return res.status(200).json({
-               success: true,
-               message: "Logged in",
-               data:{
-                   id: userExist._id,
-                   phone: userExist.phone,
-                   type: userExist.type,
-                   createdAt: userExist.createdAt
-               },
-               accessToken,
-               refreshToken,
-            })
-         }
+        // Respond with the full format for admin login WITH PHONE NUMBER IN RESPONSE
+        return res.status(200).json({
+           success: true,
+           message: "Logged in",
+           data:{
+               id: userExist._id,
+           phone: userExist.phone,
+               type: userExist.type,
+               createdAt: userExist.createdAt
+           },
+           accessToken,
+           refreshToken,
+        })
     }catch(error){
         next(error)
     }
@@ -525,5 +647,86 @@ exports.userCheckToken = async (req, res, next) =>{
         res.status(200).json({success: true, msg: "token is valid"});
     }catch(error){
         next(error)
+    }
+}
+
+// Get user data endpoint
+exports.getUserData = async (req, res, next) => {
+    try {
+        // Get user ID from the authenticated request
+        const userId = req.userId;
+        
+        // Validate user ID
+        if (!userId) {
+            return res.status(401).json({ 
+                success: false, 
+                error: "User not authenticated" 
+            });
+        }
+        
+        // Find the user in the database
+        const user = await AccountModel.findById(userId).select('phone');
+        
+        if (!user) {
+            return res.status(404).json({ 
+                success: false, 
+                error: "User not found" 
+            });
+        }
+        
+        // Return user data WITH PHONE NUMBER
+        res.status(200).json({
+            success: true,
+            data: {
+                phone: user.phone
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+}
+
+// Add PIN storage function
+exports.storePin = async (req, res, next) => {
+    try {
+        const { pin } = req.body;
+        const userId = req.userId; // Get user ID from the authenticated request
+        
+        // Validate PIN (should be exactly 4 digits)
+        if (!pin || !/^\d{4}$/.test(pin)) {
+            return res.status(400).json({ 
+                success: false, 
+                error: "PIN must be exactly 4 digits" 
+            });
+        }
+        
+        // Validate user ID
+        if (!userId) {
+            return res.status(401).json({ 
+                success: false, 
+                error: "User not authenticated" 
+            });
+        }
+        
+        // Update the user's document with the PIN
+        const updatedUser = await AccountModel.findByIdAndUpdate(
+            userId,
+            { pin: pin },
+            { new: true, runValidators: true }
+        );
+        
+        if (!updatedUser) {
+            return res.status(404).json({ 
+                success: false, 
+                error: "User not found" 
+            });
+        }
+        
+        res.status(200).json({
+            success: true,
+            msg: "PIN stored successfully"
+        });
+    } catch (error) {
+        next(error);
     }
 }
